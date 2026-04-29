@@ -1954,7 +1954,14 @@ void doFastMemoryTest(void) {
     if (g_pserver->memcheck_enabled) {
         /* Test memory */
         serverLogRaw(LL_WARNING|LL_RAW, "\n------ FAST MEMORY TEST ------\n");
-        killThreads();
+        /* In forked children (e.g. keydb-rdb-bgsave), thread handles may
+         * refer to parent threads and pthread_cancel() can crash. */
+        if (getpid() == cserver.pid) {
+            killThreads();
+        } else {
+            serverLogRaw(LL_WARNING|LL_RAW,
+                "Skipping thread cancellation in child process during crash memcheck.\n");
+        }
         if (memtest_test_linux_anonymous_maps()) {
             serverLogRaw(LL_WARNING|LL_RAW,
                 "!!! MEMORY ERROR DETECTED! Check your memory ASAP !!!\n");
