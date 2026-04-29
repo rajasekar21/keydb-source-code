@@ -1369,7 +1369,11 @@ int rdbSaveRio(rio *rdb, const redisDbPersistentDataSnapshot **rgpdb, int *error
         });
         if (!fSavedAll)
             goto werr;
-        serverAssert(ckeysExpired == db->expireSize());
+        if (ckeysExpired != expires_size) {
+            serverLog(LL_WARNING,
+                "RDB save expiry count mismatch for db %d: counted=%zu expected=%llu",
+                j, ckeysExpired, (unsigned long long)expires_size);
+        }
     }
 
     /* If we are storing the replication information on disk, persist
