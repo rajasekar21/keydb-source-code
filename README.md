@@ -149,6 +149,13 @@ installed):
     % ./utils/gen-test-certs.sh
     % ./runtest --tls
 
+Running tests in Docker on Windows
+---------
+
+If replication tests fail in Docker with a Windows bind-mounted source tree,
+see `TESTING.md` for the container-local filesystem workaround and test command
+reference.
+
 To build with KeyDB FLASH support, use:
 
     % make ENABLE_FLASH=yes

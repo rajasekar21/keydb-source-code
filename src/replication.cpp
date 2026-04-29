@@ -1255,6 +1255,16 @@ int rdbSaveSnapshotForReplication(rdbSaveInfo *rsi) {
         serverLog(LL_NOTICE, "Snapshot replication done: %s", (retval == C_OK) ? "success" : "failed");
         auto usec = ustime() - timeStart;
         serverLog(LL_NOTICE, "Transferred %zuMB total (%zuMB data) in %.2f seconds.  (%.2fGbit/s)", spreplBuf->cbWritten()/1024/1024, cbData/1024/1024, usec/1000000.0, (spreplBuf->cbWritten()*8.0)/(usec/1000000.0)/1000000000.0);
+
+        // Snapshots are owned by this async fast-sync job and must be released
+        // after the transfer completes, regardless of success/failure.
+        for (int idb = 0; idb < cserver.dbnum; ++idb) {
+            auto psnapshot = (*spvecsnapshot)[idb];
+            if (psnapshot != nullptr) {
+                g_pserver->db[idb]->endSnapshotAsync(psnapshot);
+            }
+        }
+
         if (retval == C_OK) {
             aeAcquireLock();
             replBuf.putSlavesOnline();
