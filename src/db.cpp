@@ -2851,6 +2851,7 @@ void redisDbPersistentData::ensure(const char *sdsKey, dictEntry **pde)
                     if (itr->FExpires()) {
                         objNew->expire = itr->expire;
                         objNew->SetFExpires(true);
+                        ++m_numexpires;
                     }
                     sdsfree(strT);
                     dictAdd(m_pdict, keyNew, objNew);
@@ -3390,9 +3391,13 @@ void redisDbPersistentData::prefetchKeysAsync(client *c, parsed_command &command
                         }
                     }
                     dictAdd(m_pdict, sharedKey, o);
-                    if (spexpire != nullptr)
+                    if (spexpire != nullptr) {
                         o->expire = std::move(*spexpire);
-                    o->SetFExpires(spexpire != nullptr);
+                        o->SetFExpires(true);
+                        ++m_numexpires;
+                    } else {
+                        o->SetFExpires(false);
+                    }
                 }
             }
             else
