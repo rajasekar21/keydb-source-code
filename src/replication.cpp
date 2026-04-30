@@ -3341,7 +3341,7 @@ int slaveTryPartialResynchronization(redisMaster *mi, connection *conn, int read
         char *start = reply+10;
         char *end = reply+9;
         while(end[0] != '\r' && end[0] != '\n' && end[0] != '\0') end++;
-        if (end-start == CONFIG_RUN_ID_SIZE) {
+        if (end-start == CONFIG_RUN_ID_SIZE && mi->cached_master) {
             char sznew[CONFIG_RUN_ID_SIZE+1];
             memcpy(sznew,start,CONFIG_RUN_ID_SIZE);
             sznew[CONFIG_RUN_ID_SIZE] = '\0';
@@ -3886,10 +3886,6 @@ int cancelReplicationHandshake(redisMaster *mi, int reconnect) {
     if (mi->parseState) {
         delete mi->parseState;
         mi->parseState = nullptr;
-    }
-    if (mi->bulkreadBuffer) {
-        sdsfree(mi->bulkreadBuffer);
-        mi->bulkreadBuffer = nullptr;
     }
 
     if (mi->repl_state == REPL_STATE_TRANSFER) {
