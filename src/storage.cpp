@@ -151,7 +151,7 @@ void storage_init(const char *tmpfilePath, size_t cbFileReserve)
     {
         // First create the file
         serverAssert(mkdisk == MEMKIND_DEFAULT);
-        PMEM_DIR = (char*)memkind_malloc(MEMKIND_DEFAULT, strlen(tmpfilePath));
+        PMEM_DIR = (char*)memkind_malloc(MEMKIND_DEFAULT, strlen(tmpfilePath) + 1);
         strcpy((char*)PMEM_DIR, tmpfilePath);
         int errv = memkind_create_pmem(PMEM_DIR, 0, &mkdisk);
         if (errv == MEMKIND_ERROR_INVALID)

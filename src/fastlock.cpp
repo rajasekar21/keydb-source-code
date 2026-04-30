@@ -511,7 +511,7 @@ void fastlock_auto_adjust_waits()
     memset(&sysinf, 0, sizeof sysinf);
     if (!sysinfo(&sysinf)) {
         auto avgCoreLoad = sysinf.loads[0] / get_nprocs();
-        int fHighPressureNew = (avgCoreLoad > ((1 << SI_LOAD_SHIFT) * 0.9));
+        fHighPressureNew = (avgCoreLoad > ((1 << SI_LOAD_SHIFT) * 0.9));
         __atomic_store(&g_fHighCpuPressure, &fHighPressureNew, __ATOMIC_RELEASE);
         if (fHighPressureNew)
             serverLog(!fHighPressurePrev ?  3 /*LL_WARNING*/ : 1 /* LL_VERBOSE */, "NOTICE: Detuning locks due to high load per core: %.2f%%", avgCoreLoad / (double)(1 << SI_LOAD_SHIFT)*100.0);
