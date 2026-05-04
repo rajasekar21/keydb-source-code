@@ -75,7 +75,7 @@ __attribute__((weak)) void logStackTrace(void *, int) {
 }
 #endif
 
-extern int g_fInCrash;
+extern std::atomic<int> g_fInCrash;
 extern int g_fTestMode;
 int g_fHighCpuPressure = false;
 
@@ -212,13 +212,16 @@ class DeadlockDetector
 public:
     void registerwait(fastlock *lock, pid_t thispid)
     {
-        static volatile bool fInDeadlock = false;
+        // Atomic flag: multiple threads can reach this simultaneously.
+        // exchange(true) returns the previous value; if already true another
+        // thread beat us into deadlock handling, so we bail out safely.
+        static std::atomic<bool> fInDeadlock{false};
 
-        if (lock == &m_lock || g_fInCrash)
+        if (lock == &m_lock || g_fInCrash.load(std::memory_order_acquire))
             return;
         fastlock_lock(&m_lock);
-        
-        if (fInDeadlock)
+
+        if (fInDeadlock.load(std::memory_order_acquire))
         {
             printTrace();
             fastlock_unlock(&m_lock);
@@ -255,7 +258,7 @@ public:
 #ifdef HAVE_BACKTRACE
 #ifdef __linux__
                 int mask = -1;
-                fInDeadlock = true;
+                fInDeadlock.store(true, std::memory_order_release);
                 fastlock_unlock(&m_lock);
                 futex(&lock->m_ticket.u, FUTEX_WAKE_BITSET_PRIVATE, INT_MAX, nullptr, mask);
                 futex(&itr->second->m_ticket.u, FUTEX_WAKE_BITSET_PRIVATE, INT_MAX, nullptr, mask);

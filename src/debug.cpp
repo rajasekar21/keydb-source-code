@@ -63,7 +63,8 @@ typedef ucontext_t sigcontext_t;
 #endif
 #endif
 
-int g_fInCrash = false;
+// Must be atomic: read from deadlock detector threads, written from signal handlers.
+std::atomic<int> g_fInCrash{0};
 
 #if defined(__APPLE__) && defined(__arm64__)
 #include <mach/mach.h>

@@ -3956,10 +3956,10 @@ int populateCommandTableParseFlags(struct redisCommand *c, const char *strflags)
 
 
 int moduleGILAcquiredByModule(void);
-extern int g_fInCrash;
+// g_fInCrash is declared in serverassert.h (included above) as std::atomic<int>
 static inline int GlobalLocksAcquired(void)  // Used in asserts to verify all global locks are correctly acquired for a server-thread to operate
 {
-    return aeThreadOwnsLock() || moduleGILAcquiredByModule() || g_fInCrash;
+    return aeThreadOwnsLock() || moduleGILAcquiredByModule() || g_fInCrash.load(std::memory_order_acquire);
 }
 
 inline int ielFromEventLoop(const aeEventLoop *eventLoop)

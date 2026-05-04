@@ -113,9 +113,10 @@ void pool_free(struct alloc_pool *ppool, void *pv)
         }
         cur = cur->pnext;
     }
-    serverLog(LL_WARNING, "obj not from pool");
-    sfree(obj); // we don't know where it came from
-    return;
+    // The pointer does not belong to any known pool page.
+    // Calling sfree() on it would pass an untracked pointer to memkind_free,
+    // risking heap corruption.  Panic loudly so the bug surfaces immediately.
+    serverPanic("pool_free: object %p not found in any pool page", (void*)obj);
 }
 
 extern size_t OBJ_ENCODING_EMBSTR_SIZE_LIMIT;

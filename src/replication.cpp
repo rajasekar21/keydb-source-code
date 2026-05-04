@@ -2653,6 +2653,10 @@ bool readSnapshotBulkPayload(connection *conn, redisMaster *mi, rdbSaveInfo &rsi
     serverLog(LL_NOTICE, "Fast sync complete");
     delete mi->parseState;
     mi->parseState = nullptr;
+    // Free the read buffer here; cancelReplicationHandshake also frees it,
+    // so NULL it now to prevent a double-free if an exception fires after this point.
+    sdsfree(mi->bulkreadBuffer);
+    mi->bulkreadBuffer = nullptr;
     return true;
 }
 
@@ -3317,7 +3321,19 @@ int slaveTryPartialResynchronization(redisMaster *mi, connection *conn, int read
         } else {
             memcpy(mi->master_replid, replid, offset-replid-1);
             mi->master_replid[CONFIG_RUN_ID_SIZE] = '\0';
-            mi->master_initial_offset = strtoll(offset,NULL,10);
+            long long parsed_offset = strtoll(offset, NULL, 10);
+            // Reject implausible offsets: negative values or values so large that
+            // subsequent master_repl_offset arithmetic would overflow a signed 64-bit int.
+            if (parsed_offset < 0 || parsed_offset > (LLONG_MAX / 2)) {
+                serverLog(LL_WARNING,
+                    "Master sent suspicious FULLRESYNC offset %lld, forcing fresh resync.",
+                    parsed_offset);
+                memset(mi->master_replid, 0, CONFIG_RUN_ID_SIZE+1);
+                replicationDiscardCachedMaster(mi);
+                sdsfree(reply);
+                return PSYNC_NOT_SUPPORTED;
+            }
+            mi->master_initial_offset = parsed_offset;
             serverLog(LL_NOTICE,"Full resync from master: %s:%lld",
                 mi->master_replid,
                 mi->master_initial_offset);

@@ -66,6 +66,9 @@ static pthread_mutex_t bio_mutex[BIO_NUM_OPS];
 static pthread_cond_t bio_newjob_cond[BIO_NUM_OPS];
 static pthread_cond_t bio_step_cond[BIO_NUM_OPS];
 static list *bio_jobs[BIO_NUM_OPS];
+// Cooperative shutdown flag: set to 1 to request all BIO threads to exit cleanly
+// without relying on pthread_cancel (which can fire while a mutex is held).
+static volatile int bio_should_exit = 0;
 /* The following array is used to hold the number of pending jobs for every
  * OP type. This allows us to export the bioPendingJobsOfType() API that is
  * useful when the main thread wants to perform some operation that may involve
@@ -191,8 +194,6 @@ void *bioProcessBackgroundJobs(void *arg) {
 
     redisSetCpuAffinity(g_pserver->bio_cpulist);
 
-    makeThreadKillable();
-
     pthread_mutex_lock(&bio_mutex[type]);
     /* Block SIGALRM so we are sure that only the main thread will
      * receive the watchdog signal. */
@@ -202,10 +203,10 @@ void *bioProcessBackgroundJobs(void *arg) {
         serverLog(LL_WARNING,
             "Warning: can't mask SIGALRM in bio.c thread: %s", strerror(errno));
 
-    while(1) {
+    while(!bio_should_exit) {
         listNode *ln;
 
-        /* The loop always starts with the lock hold. */
+        /* The loop always starts with the lock held. */
         if (listLength(bio_jobs[type]) == 0) {
             pthread_cond_wait(&bio_newjob_cond[type],&bio_mutex[type]);
             continue;
@@ -287,24 +288,33 @@ unsigned long long bioWaitStepOfType(int type) {
     return val;
 }
 
-/* Kill the running bio threads in an unclean way. This function should be
- * used only when it's critical to stop the threads for some reason.
- * Currently Redis does this only on crash (for instance on SIGSEGV) in order
- * to perform a fast memory check without other threads messing with memory. */
+/* Request all BIO threads to stop cooperatively.
+ * Sets the exit flag and wakes each thread's condition variable so that it
+ * can observe the flag without being stuck in pthread_cond_wait.
+ * We then join each thread to ensure they have released their mutexes cleanly.
+ * This avoids the previous pthread_cancel() approach which could fire while a
+ * thread held bio_mutex, leaving the mutex permanently locked and causing
+ * deadlocks in any subsequent bio job submission. */
 void bioKillThreads(void) {
     int err, j;
 
+    bio_should_exit = 1;
+    for (j = 0; j < BIO_NUM_OPS; j++) {
+        pthread_cond_broadcast(&bio_newjob_cond[j]);
+    }
+
     for (j = 0; j < BIO_NUM_OPS; j++) {
         if (bio_threads[j] == pthread_self()) continue;
-        if (bio_threads[j] && pthread_cancel(bio_threads[j]) == 0) {
-            if ((err = pthread_join(bio_threads[j],NULL)) != 0) {
+        if (bio_threads[j]) {
+            if ((err = pthread_join(bio_threads[j], NULL)) != 0) {
                 serverLog(LL_WARNING,
                     "Bio thread for job type #%d can not be joined: %s",
                         j, strerror(err));
             } else {
                 serverLog(LL_WARNING,
-                    "Bio thread for job type #%d terminated",j);
+                    "Bio thread for job type #%d terminated", j);
             }
+            bio_threads[j] = 0;
         }
     }
 }

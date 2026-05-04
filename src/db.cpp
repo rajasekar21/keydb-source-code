@@ -322,13 +322,24 @@ void redisDb::dbOverwriteCore(redisDb::iter itr, sds keySds, robj *val, bool fUp
     initStaticStringObject(keyO, keySds);
     robj *key = &keyO;
 
+    // Track whether we have already duplicated val away from a shared object.
+    // Without this guard, if both FExpires() and fUpdateMvcc are true we would
+    // call dupStringObject twice: the first dup produces refcount==1 (not
+    // OBJ_SHARED_REFCOUNT) so the second check would be false — but under a
+    // race the first duplicate could already have been freed, leaving the second
+    // check operating on a stale value. Using one flag makes the intent explicit
+    // and eliminates the double-dup memory leak.
+    bool fDuped = false;
+
     if (old->FExpires()) {
         if (fRemoveExpire) {
             ::removeExpire(this, key);
         }
         else {
-            if (val->getrefcount(std::memory_order_relaxed) == OBJ_SHARED_REFCOUNT)
+            if (val->getrefcount(std::memory_order_relaxed) == OBJ_SHARED_REFCOUNT) {
                 val = dupStringObject(val);
+                fDuped = true;
+            }
             ::updateExpire(this, itr.key(), old, val);
         }
     }
@@ -337,7 +348,7 @@ void redisDb::dbOverwriteCore(redisDb::iter itr, sds keySds, robj *val, bool fUp
         val->lru = old->lru;
     }
     if (fUpdateMvcc) {
-        if (val->getrefcount(std::memory_order_relaxed) == OBJ_SHARED_REFCOUNT)
+        if (!fDuped && val->getrefcount(std::memory_order_relaxed) == OBJ_SHARED_REFCOUNT)
             val = dupStringObject(val);
         setMvccTstamp(val, getMvccTstamp());
     }

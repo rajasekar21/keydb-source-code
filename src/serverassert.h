@@ -9,11 +9,12 @@ extern "C" void _serverPanic(const char *file, int line, const char *msg, ...)
 extern "C" void _serverPanic(const char *file, int line, const char *msg, ...);
 #endif
 
-extern int g_fInCrash;
+#include <atomic>
+extern std::atomic<int> g_fInCrash;
 
 /* We can print the stacktrace, so our assert is defined this way: */
 #define serverAssertWithInfo(_c,_o,_e) ((_e)?(void)0 : (_serverAssertWithInfo(_c,_o,#_e,__FILE__,__LINE__),_exit(1)))
-#define serverAssert(_e) (((_e) || g_fInCrash) ?(void)0 : (_serverAssert(#_e,__FILE__,__LINE__),_exit(1)))
+#define serverAssert(_e) (((_e) || g_fInCrash.load(std::memory_order_acquire)) ?(void)0 : (_serverAssert(#_e,__FILE__,__LINE__),_exit(1)))
 #ifdef _DEBUG
 #define serverAssertDebug(_e) serverAssert(_e)
 #else

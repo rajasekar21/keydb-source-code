@@ -1762,12 +1762,15 @@ void freeClientAsync(client *c) {
      * may access the list while Redis uses I/O threads. All the other accesses
      * are in the context of the main thread while the other threads are
      * idle. */
-    if (c->flags & CLIENT_CLOSE_ASAP || c->flags & CLIENT_LUA) return;  // early exit before taking the lock
+    // Acquire g_lockasyncfree FIRST to prevent ABBA deadlock:
+    // freeClientsInAsyncFreeQueue holds g_lockasyncfree then may acquire c->lock,
+    // so we must take them in the same order here.
+    std::unique_lock<fastlock> ul(g_lockasyncfree);
+    if (c->flags & CLIENT_CLOSE_ASAP || c->flags & CLIENT_LUA) return;
     std::lock_guard<decltype(c->lock)> clientlock(c->lock);
-    if (c->flags & CLIENT_CLOSE_ASAP || c->flags & CLIENT_LUA) return;  // re-check under the lock to close the TOCTOU window
+    if (c->flags & CLIENT_CLOSE_ASAP || c->flags & CLIENT_LUA) return;
     c->flags |= CLIENT_CLOSE_ASAP;
     c->repl_down_since = g_pserver->unixtime;
-    std::unique_lock<fastlock> ul(g_lockasyncfree);
     listAddNodeTail(g_pserver->clients_to_close,c);
 }
 
