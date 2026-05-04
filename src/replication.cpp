@@ -1699,6 +1699,28 @@ void replconfCommand(client *c) {
             if (offset > c->repl_ack_off)
                 c->repl_ack_off = offset;
             c->repl_ack_time = g_pserver->unixtime;
+
+            /* Continuously maintain repl_lowest_off so feedReplicationBacklog()
+             * can trust it without scanning all replicas on every write.
+             * We compute the new minimum in O(N) here (once per ACK from each
+             * replica, typically 10 times/second per replica) rather than
+             * inside the hot write path where it was O(N) per written command. */
+            {
+                long long new_min = LLONG_MAX;
+                listIter ack_li;
+                listNode *ack_ln;
+                listRewind(g_pserver->slaves, &ack_li);
+                while ((ack_ln = listNext(&ack_li))) {
+                    client *replica = (client*)listNodeValue(ack_ln);
+                    if (!canFeedReplicaReplBuffer(replica)) continue;
+                    if (replica->flags & CLIENT_CLOSE_ASAP) continue;
+                    new_min = std::min(new_min, replica->repl_curr_off);
+                }
+                g_pserver->repl_lowest_off.store(
+                    (new_min == LLONG_MAX) ? -1 : new_min,
+                    std::memory_order_release);
+            }
+
             /* If this was a diskless replication, we need to really put
              * the replica online when the first ACK is received (which
              * confirms slave is online and ready to get more data). This

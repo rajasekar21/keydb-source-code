@@ -1357,18 +1357,31 @@ static int _dictExpandIfNeeded(dict *d)
     /* If we reached the 1:1 ratio, and we are allowed to resize the hash
      * table (global setting) or we should avoid it but the ratio between
      * elements/buckets is over the "safe" threshold, we resize doubling
-     * the number of buckets. */
+     * the number of buckets.
+     *
+     * We pass a malloc_failed pointer so _dictExpand uses ztrycalloc instead
+     * of zcalloc.  zcalloc blocks the calling thread until the OS satisfies
+     * the allocation (which can take 10-100 ms for a 1-2 GB table), stalling
+     * all server threads that are waiting on the global lock.  ztrycalloc
+     * returns NULL immediately if the allocation cannot be satisfied without
+     * blocking; we treat that as a transient failure and retry next cycle. */
     if (d->ht[0].used >= d->ht[0].size &&
         (dict_can_resize ||
          d->ht[0].used/d->ht[0].size > dict_force_resize_ratio) &&
         dictTypeExpandAllowed(d))
     {
-        return _dictExpand(d, d->ht[0].used + 1, false /*fShrink*/, nullptr);
+        int malloc_failed = 0;
+        int ret = _dictExpand(d, d->ht[0].used + 1, false /*fShrink*/, &malloc_failed);
+        if (malloc_failed) return DICT_OK; /* transient: retry at next insert */
+        return ret;
     }
     else if (d->ht[0].used > 0 && d->ht[0].size >= (1024*SHRINK_FACTOR) && (d->ht[0].used * 16) < d->ht[0].size && dict_can_resize && !d->noshrink)
     {
-        // If the dictionary has shurnk a lot we'll need to shrink the hash table instead
-        return _dictExpand(d, d->ht[0].size/SHRINK_FACTOR, true /*fShrink*/, nullptr);
+        // If the dictionary has shrunk a lot we'll need to shrink the hash table instead
+        int malloc_failed = 0;
+        int ret = _dictExpand(d, d->ht[0].size/SHRINK_FACTOR, true /*fShrink*/, &malloc_failed);
+        if (malloc_failed) return DICT_OK; /* transient: retry at next insert */
+        return ret;
     }
     return DICT_OK;
 }

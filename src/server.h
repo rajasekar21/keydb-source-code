@@ -347,7 +347,11 @@ inline bool operator!=(const void *p, const robj_sharedptr &rhs)
 #define MAX_CLIENTS_PER_CLOCK_TICK 200          /* HZ is adapted based on that. */
 #define CONFIG_MAX_LINE    1024
 #define CRON_DBS_PER_CALL 16
-#define NET_MAX_WRITES_PER_EVENT (1024*64)
+// Raised from 64 KB to 256 KB: at 1 Gbps a client can absorb ~125 KB/ms, so
+// capping at 64 KB forces unnecessary re-queuing every event loop iteration.
+// 256 KB keeps fast clients drained with 4x fewer wakeups while still
+// preventing any single client from monopolising the event loop for >2 ms.
+#define NET_MAX_WRITES_PER_EVENT (1024*256)
 #define PROTO_SHARED_SELECT_CMDS 10
 #define OBJ_SHARED_INTEGERS 10000
 #define OBJ_SHARED_BULKHDR_LEN 32

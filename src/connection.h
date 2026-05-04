@@ -147,6 +147,26 @@ static inline int connWrite(connection *conn, const void *data, size_t data_len)
     return conn->type->write(conn, data, data_len);
 }
 
+/* Scatter-gather write for plain TCP connections.
+ * Falls back to a serialised connWrite loop for TLS connections (which cannot
+ * use writev directly because the TLS record layer maintains its own framing).
+ * Returns total bytes written, or -1 on error (errno is set by writev/write). */
+#include <sys/uio.h>
+static inline ssize_t connWritev(connection *conn, const struct iovec *iov, int iovcnt) {
+    if (conn->type->get_type(conn) == CONN_TYPE_SOCKET) {
+        return writev(conn->fd, iov, iovcnt);
+    }
+    // TLS fallback: issue each buffer via connWrite sequentially
+    ssize_t total = 0;
+    for (int i = 0; i < iovcnt; i++) {
+        ssize_t n = conn->type->write(conn, iov[i].iov_base, iov[i].iov_len);
+        if (n <= 0) return (total > 0) ? total : n;
+        total += n;
+        if ((size_t)n < iov[i].iov_len) break; // short write
+    }
+    return total;
+}
+
 /* Read from the connection, behaves the same as read(2).
  * 
  * Like read(2), a short read is possible.  A return value of 0 will indicate the

@@ -328,6 +328,7 @@ aeEventLoop *aeCreateEventLoop(int setsize) {
     eventLoop->beforesleep = NULL;
     eventLoop->aftersleep = NULL;
     eventLoop->flags = 0;
+    eventLoop->timerNearestWhen = UINT64_MAX;
     if (aeApiCreate(eventLoop) == -1) goto err;
     /* Events with mask == AE_NONE are not set. So let's initialize the
      * vector with it. */
@@ -513,6 +514,9 @@ extern "C" long long aeCreateTimeEvent(aeEventLoop *eventLoop, long long millise
     if (te->next)
         te->next->prev = te;
     eventLoop->timeEventHead = te;
+    // Keep timerNearestWhen current so usUntilEarliestTimer can avoid O(N) scan.
+    if (te->when < eventLoop->timerNearestWhen)
+        eventLoop->timerNearestWhen = te->when;
     return id;
 }
 
@@ -533,25 +537,18 @@ extern "C" int aeDeleteTimeEvent(aeEventLoop *eventLoop, long long id)
 /* How many microseconds until the first timer should fire.
  * If there are no timers, -1 is returned.
  *
- * Note that's O(N) since time events are unsorted.
- * Possible optimizations (not needed by Redis so far, but...):
- * 1) Insert the event in order, so that the nearest is just the head.
- *    Much better but still insertion or deletion of timers is O(N).
- * 2) Use a skiplist to have this operation as O(1) and insertion as O(log(N)).
+ * Previously O(N) per call (full linked-list scan), now O(1) using the
+ * timerNearestWhen cache maintained by aeCreateTimeEvent and processTimeEvents.
+ * The cached value may be pessimistic (point to a deleted timer whose id has
+ * been set to AE_DELETED_EVENT_ID), causing epoll_wait to wake up slightly
+ * early -- but it is never optimistic, so real deadlines are never missed.
  */
 static int64_t usUntilEarliestTimer(aeEventLoop *eventLoop) {
-    aeTimeEvent *te = eventLoop->timeEventHead;
-    if (te == NULL) return -1;
-
-    aeTimeEvent *earliest = NULL;
-    while (te) {
-        if (!earliest || te->when < earliest->when)
-            earliest = te;
-        te = te->next;
-    }
-
+    if (eventLoop->timeEventHead == NULL) return -1;
+    monotime nearest = eventLoop->timerNearestWhen;
+    if (nearest == UINT64_MAX) return -1;
     monotime now = getMonotonicUs();
-    return (now >= earliest->when) ? 0 : earliest->when - now;
+    return (now >= nearest) ? 0 : (int64_t)(nearest - now);
 }
 
 /* Process time events */
@@ -629,6 +626,20 @@ static int processTimeEvents(aeEventLoop *eventLoop) {
         }
         te = te->next;
     }
+
+    // Refresh timerNearestWhen after processing so the next usUntilEarliestTimer
+    // call doesn't sleep too long if timers were deleted or rescheduled.
+    // This O(N) scan happens at most once per processTimeEvents invocation (once
+    // per server Hz tick), not once per event loop iteration like the old code.
+    if (processed > 0) {
+        monotime newNearest = UINT64_MAX;
+        for (aeTimeEvent *scan = eventLoop->timeEventHead; scan; scan = scan->next) {
+            if (scan->id != AE_DELETED_EVENT_ID && scan->when < newNearest)
+                newNearest = scan->when;
+        }
+        eventLoop->timerNearestWhen = newNearest;
+    }
+
     return processed;
 }
 

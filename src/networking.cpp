@@ -1876,66 +1876,96 @@ int writeToClient(client *c, int handler_installed) {
             }
         }
     } else {
-        while(clientHasPendingReplies(c)) {
-            if (c->bufpos > 0) {
-                auto bufpos = c->bufpos;
-                lock.unlock();
-                nwritten = connWrite(c->conn,c->buf+c->sentlen,bufpos-c->sentlen);
-                lock.lock();
-                if (nwritten <= 0) break;
-                c->sentlen += nwritten;
-                totwritten += nwritten;
+        /* Coalesced scatter-gather write path.
+         *
+         * Instead of one lock-release / connWrite / lock-acquire per reply block
+         * (the old pattern), we:
+         *   1. Collect up to IOV_MAX pending buffers into a stack-allocated iovec
+         *      array while holding c->lock.
+         *   2. Drop the lock and issue a single connWritev() syscall.
+         *   3. Re-acquire the lock and account for however many bytes were sent.
+         *
+         * This reduces lock round-trips from O(reply_blocks) to O(1) per flush
+         * and reduces syscall count by up to IOV_MAX-fold, directly lowering
+         * per-client CPU overhead and tail latency at high connection counts.
+         */
+        #define WRITETO_IOV_MAX 64
+        struct iovec iov[WRITETO_IOV_MAX];
 
-                /* If the buffer was sent, set bufpos to zero to continue with
-                * the remainder of the reply. */
+        while (clientHasPendingReplies(c)) {
+            int iovcnt = 0;
+            size_t iov_bytes = 0;
+
+            /* Build iovec while holding the lock -- no I/O here. */
+            if (c->bufpos > 0) {
+                iov[iovcnt].iov_base = c->buf + c->sentlen;
+                iov[iovcnt].iov_len  = (size_t)(c->bufpos - c->sentlen);
+                iov_bytes += iov[iovcnt].iov_len;
+                iovcnt++;
+            }
+            {
+                listIter li;
+                listNode *ln;
+                listRewind(c->reply, &li);
+                while ((ln = listNext(&li)) && iovcnt < WRITETO_IOV_MAX) {
+                    o = (clientReplyBlock*)listNodeValue(ln);
+                    if (o->used == 0) continue;
+                    size_t off = (ln == listFirst(c->reply) && c->bufpos == 0) ? c->sentlen : 0;
+                    iov[iovcnt].iov_base = o->buf() + off;
+                    iov[iovcnt].iov_len  = o->used - off;
+                    iov_bytes += iov[iovcnt].iov_len;
+                    iovcnt++;
+                }
+            }
+
+            if (iovcnt == 0) break;
+
+            lock.unlock();
+            nwritten = connWritev(c->conn, iov, iovcnt);
+            lock.lock();
+
+            if (nwritten <= 0) break;
+            totwritten += nwritten;
+
+            /* Account for written bytes: drain bufpos first, then reply list. */
+            ssize_t remaining = nwritten;
+            if (c->bufpos > 0) {
+                ssize_t avail = (ssize_t)(c->bufpos - c->sentlen);
+                ssize_t took  = (remaining < avail) ? remaining : avail;
+                c->sentlen  += took;
+                remaining   -= took;
                 if ((int)c->sentlen == c->bufpos) {
-                    c->bufpos = 0;
+                    c->bufpos  = 0;
                     c->sentlen = 0;
                 }
-            } else {
+            }
+            while (remaining > 0 && listLength(c->reply) > 0) {
                 o = (clientReplyBlock*)listNodeValue(listFirst(c->reply));
                 if (o->used == 0) {
                     c->reply_bytes -= o->size;
-                    listDelNode(c->reply,listFirst(c->reply));
+                    listDelNode(c->reply, listFirst(c->reply));
                     continue;
                 }
-
-                auto used = o->used;
-                lock.unlock();
-                nwritten = connWrite(c->conn, o->buf() + c->sentlen, used - c->sentlen);
-                lock.lock();
-                if (nwritten <= 0) break;
-                c->sentlen += nwritten;
-                totwritten += nwritten;
-                
-                /* If we fully sent the object on head go to the next one */
+                ssize_t avail = (ssize_t)(o->used - c->sentlen);
+                ssize_t took  = (remaining < avail) ? remaining : avail;
+                c->sentlen  += took;
+                remaining   -= took;
                 if (c->sentlen == o->used) {
                     c->reply_bytes -= o->size;
-                    listDelNode(c->reply,listFirst(c->reply));
+                    listDelNode(c->reply, listFirst(c->reply));
                     c->sentlen = 0;
-                    /* If there are no longer objects in the list, we expect
-                        * the count of reply bytes to be exactly zero. */
                     if (listLength(c->reply) == 0)
                         serverAssert(c->reply_bytes == 0);
                 }
             }
-            /* Note that we avoid to send more than NET_MAX_WRITES_PER_EVENT
-            * bytes, in a single threaded server it's a good idea to serve
-            * other clients as well, even if a very large request comes from
-            * super fast link that is always able to accept data (in real world
-            * scenario think about 'KEYS *' against the loopback interface).
-            *
-            * However if we are over the maxmemory limit we ignore that and
-            * just deliver as much data as it is possible to deliver.
-            *
-            * Moreover, we also send as much as possible if the client is
-            * a replica or a monitor (otherwise, on high-speed traffic, the
-            * replication/output buffer will grow indefinitely) */
+
+            /* Honour the per-event write budget to avoid starving other clients. */
             if (totwritten > NET_MAX_WRITES_PER_EVENT &&
                 (g_pserver->maxmemory == 0 ||
-                zmalloc_used_memory() < g_pserver->maxmemory) &&
+                 zmalloc_used_memory() < g_pserver->maxmemory) &&
                 !(c->flags & CLIENT_SLAVE)) break;
         }
+        #undef WRITETO_IOV_MAX
     }
     g_pserver->stat_net_output_bytes += totwritten;
     if (nwritten == -1) {

@@ -128,6 +128,12 @@ typedef struct aeEventLoop {
     int fdCmdRead;
     int cevents;
     int flags;
+    /* Cached earliest timer deadline (monotonic microseconds).
+     * Updated on every timer insert and after processTimeEvents runs.
+     * May be pessimistic (point to a deleted timer) but never optimistic,
+     * so epoll_wait may return early but will never sleep past a real deadline.
+     * Reduces usUntilEarliestTimer from O(N) to O(1) per event loop iteration. */
+    monotime timerNearestWhen;
 } aeEventLoop;
 
 /* Prototypes */
