@@ -1171,7 +1171,7 @@ public:
     void updateValue(dict_iter itr, robj *val);
     bool syncDelete(robj *key);
     bool asyncDelete(robj *key);
-    size_t expireSize() const { return m_numexpires; }
+    size_t expireSize() const { return m_numexpires.load(std::memory_order_relaxed); }
     int removeExpire(robj *key, dict_iter itr);
     int removeSubkeyExpire(robj *key, robj *subkey);
     void clear(void(callback)(void*));
@@ -1247,8 +1247,9 @@ private:
     size_t m_cnewKeysPending = 0;
     std::shared_ptr<StorageCache> m_spstorage = nullptr;
 
-    // Expire
-    size_t m_numexpires = 0;
+    // Expire — written on every key insert/delete with expiry from any worker thread;
+    // std::atomic ensures no torn read even when INFO is sampled without g_lock.
+    std::atomic<size_t> m_numexpires {0};
 
     // These two pointers are the same, UNLESS the database has been cleared.
     //      in which case m_pdbSnapshot is NULL and we continue as though we weren'
@@ -2522,6 +2523,9 @@ struct redisServer {
     /* Replication (master) */
     char replid[CONFIG_RUN_ID_SIZE+1];  /* My current replication ID. */
     char replid2[CONFIG_RUN_ID_SIZE+1]; /* replid inherited from master*/
+    /* All writes to master_repl_offset happen inside feedReplicationBacklog() which
+     * runs only while g_lock is held; reads from RDB/INFO paths also hold g_lock.
+     * No atomic needed — the global lock provides the required happens-before. */
     long long master_repl_offset;   /* My current replication offset */
     long long second_replid_offset; /* Accept offsets up to this for replid2. */
     int replicaseldb;                 /* Last SELECTed DB in replication output */

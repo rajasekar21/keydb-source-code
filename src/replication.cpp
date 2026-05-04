@@ -3978,6 +3978,34 @@ struct redisMaster *replicationAddMaster(char *ip, int port) {
             return nullptr;
     }
 
+    // CONC-05: Cycle detection — refuse if the prospective master is already our slave.
+    // An active-replica topology where A→B and B→A would cause infinite replication loops.
+    {
+        listIter li_cycle;
+        listNode *ln_cycle;
+        listRewind(g_pserver->slaves, &li_cycle);
+        while ((ln_cycle = listNext(&li_cycle))) {
+            client *slave = (client*)listNodeValue(ln_cycle);
+            if (!(slave->flags & CLIENT_SLAVE)) continue;
+            if (slave->slave_listening_port == 0 || slave->slave_listening_port != port) continue;
+
+            char peer_ip[NET_IP_STR_LEN];
+            const char *check_ip = nullptr;
+            if (slave->slave_addr && slave->slave_addr[0]) {
+                check_ip = slave->slave_addr;
+            } else if (connPeerToString(slave->conn, peer_ip, sizeof(peer_ip), nullptr) == 0) {
+                check_ip = peer_ip;
+            }
+            if (check_ip && strcasecmp(check_ip, ip) == 0) {
+                serverLog(LL_WARNING,
+                    "replicationAddMaster: refusing %s:%d — "
+                    "it is already replicating from us (cycle detected)",
+                    ip, port);
+                return nullptr;
+            }
+        }
+    }
+
     // Pre-req satisfied, lets continue
     int was_master = listLength(g_pserver->masters) == 0;
     redisMaster *mi = nullptr;

@@ -74,7 +74,7 @@ const redisDbPersistentDataSnapshot *redisDbPersistentData::createSnapshot(uint6
     spdb->m_fTrackingChanges = 0;
     spdb->m_pdict = m_pdict;
     spdb->m_pdictTombstone = m_pdictTombstone;
-    spdb->m_numexpires = m_numexpires;
+    spdb->m_numexpires = m_numexpires.load(std::memory_order_relaxed);
     // Add a fake iterator so the dicts don't rehash (they need to be read only)
     dictPauseRehashing(spdb->m_pdict);
     dictForceRehash(spdb->m_pdictTombstone);    // prevent rehashing by finishing the rehash now
