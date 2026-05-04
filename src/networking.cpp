@@ -779,6 +779,11 @@ void setDeferredAggregateLen(client *c, void *node, long length, char prefix) {
         size_t lenstr_len = snprintf(lenstr, sizeof(lenstr), "%c%ld\r\n", prefix, length);
         setDeferredReply(c, node, lenstr, lenstr_len);
     } else {
+        /* Mirror the correct-thread NULL guard: if replyAsync was not
+         * allocated when addReplyDeferredLen() ran, the client cannot
+         * accept writes — skip the splice. */
+        if (c->replyAsync == NULL) return;
+
         char lenstr[128];
         int lenstr_len = snprintf(lenstr, sizeof(lenstr), "%c%ld\r\n", prefix, length);
 
@@ -2311,7 +2316,11 @@ static void setProtocolError(const char *errstr, client *c) {
         /* Sample some protocol to given an idea about what was inside. */
         char buf[256];
         if (sdslen(c->querybuf)-c->qb_pos < PROTO_DUMP_LEN) {
-            snprintf(buf,sizeof(buf),"Query buffer during protocol error: '%s'", c->querybuf+c->qb_pos);
+            /* Use %.*s: querybuf is sds and may contain embedded NUL bytes;
+             * a bare %s would silently truncate at the first embedded NUL,
+             * hiding the actual protocol payload in the log. */
+            int dump_len = (int)(sdslen(c->querybuf) - c->qb_pos);
+            snprintf(buf,sizeof(buf),"Query buffer during protocol error: '%.*s'", dump_len, c->querybuf+c->qb_pos);
         } else {
             snprintf(buf,sizeof(buf),"Query buffer during protocol error: '%.*s' (... more %zu bytes ...) '%.*s'", PROTO_DUMP_LEN/2, c->querybuf+c->qb_pos, sdslen(c->querybuf)-c->qb_pos-PROTO_DUMP_LEN, PROTO_DUMP_LEN/2, c->querybuf+sdslen(c->querybuf)-PROTO_DUMP_LEN/2);
         }

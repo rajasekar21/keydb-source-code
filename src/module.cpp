@@ -3933,6 +3933,14 @@ void moduleParseCallReply_Array(RedisModuleCallReply *reply) {
         return;
     }
 
+    /* Guard against integer overflow: arraylen * sizeof() must fit in size_t.
+     * A well-formed RESP array from a trusted master will never approach this
+     * limit; a value this large indicates a corrupt or adversarial response. */
+    if (arraylen < 0 || (unsigned long long)arraylen > (SIZE_MAX / sizeof(RedisModuleCallReply))) {
+        reply->type = REDISMODULE_REPLY_NULL;
+        return;
+    }
+
     reply->val.array = (RedisModuleCallReply*)zmalloc(sizeof(RedisModuleCallReply)*arraylen, MALLOC_LOCAL);
     reply->len = arraylen;
     for (j = 0; j < arraylen; j++) {
