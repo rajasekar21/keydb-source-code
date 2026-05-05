@@ -402,9 +402,9 @@ void feedReplicationBacklog(const void *ptr, size_t len) {
 
             if (min_offset == LLONG_MAX) {
                 min_offset = g_pserver->repl_batch_offStart;
-                g_pserver->repl_lowest_off = -1;
+                g_pserver->repl_lowest_off.store(-1, std::memory_order_release);
             } else {
-                g_pserver->repl_lowest_off = min_offset;
+                g_pserver->repl_lowest_off.store(min_offset, std::memory_order_release);
             }
 
             minimumsize = g_pserver->master_repl_offset + len - min_offset + 1;
@@ -418,7 +418,7 @@ void feedReplicationBacklog(const void *ptr, size_t len) {
             } else if (!listening_replicas) {
                 // We need to update a few variables or later asserts will notice we dropped data
                 g_pserver->repl_batch_offStart = g_pserver->master_repl_offset + len;
-                g_pserver->repl_lowest_off = -1;
+                g_pserver->repl_lowest_off.store(-1, std::memory_order_release);
                 if (!repl_backlog_lock.owns_lock())
                     repl_backlog_lock.lock();   // we need to acquire the lock if we'll be overwriting data that writeToClient may be reading
             }
@@ -936,9 +936,14 @@ int masterTryPartialResynchronization(client *c) {
     }
 
     /* We still have the data our replica is asking for? */
+    /* Use master_repl_offset as the upper bound instead of
+     * repl_backlog_off + repl_backlog_histlen: the two are semantically
+     * equivalent (the backlog covers exactly [repl_backlog_off,
+     * master_repl_offset]), but the addition can overflow when both
+     * operands are near LLONG_MAX on a long-running master. */
     if (!g_pserver->repl_backlog ||
         psync_offset < g_pserver->repl_backlog_off ||
-        psync_offset > (g_pserver->repl_backlog_off + g_pserver->repl_backlog_histlen))
+        psync_offset > g_pserver->master_repl_offset)
     {
         serverLog(LL_NOTICE,
             "Unable to partial resync with replica %s for lack of backlog (Replica request was: %lld).", replicationGetSlaveName(c), psync_offset);
@@ -1709,6 +1714,10 @@ void replconfCommand(client *c) {
                 long long new_min = LLONG_MAX;
                 listIter ack_li;
                 listNode *ack_ln;
+                /* repl_curr_off is written by writeToClient() under repl_backlog_lock;
+                 * acquire the same lock here to prevent a data race on 64-bit reads
+                 * when the threadsafe write path runs concurrently without g_lock. */
+                std::lock_guard<fastlock> backlog_guard(g_pserver->repl_backlog_lock);
                 listRewind(g_pserver->slaves, &ack_li);
                 while ((ack_ln = listNext(&ack_li))) {
                     client *replica = (client*)listNodeValue(ack_ln);
@@ -5843,7 +5852,7 @@ void trimReplicationBacklog() {
     serverAssert(g_pserver->repl_batch_offStart < 0);   // we shouldn't be in a batch
     if (g_pserver->repl_backlog_size <= g_pserver->repl_backlog_config_size)
         return; // We're already a good size
-    if (g_pserver->repl_lowest_off > 0 && (g_pserver->master_repl_offset - g_pserver->repl_lowest_off + 1) > g_pserver->repl_backlog_config_size)
+    if (g_pserver->repl_lowest_off.load(std::memory_order_acquire) > 0 && (g_pserver->master_repl_offset - g_pserver->repl_lowest_off.load(std::memory_order_acquire) + 1) > g_pserver->repl_backlog_config_size)
         return; // There is untransmitted data we can't truncate
     if (cserver.force_backlog_disk && g_pserver->repl_backlog == g_pserver->repl_backlog_disk)
         return; // We're already in the disk backlog and we're told to stay there
