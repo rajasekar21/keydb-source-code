@@ -255,6 +255,14 @@ void *bioProcessBackgroundJobs(void *arg) {
         /* Unblock threads blocked on bioWaitStepOfType() if any. */
         pthread_cond_broadcast(&bio_step_cond[type]);
     }
+
+    /* The loop always holds bio_mutex[type] on entry and on each iteration
+     * end (re-locked at line 251).  When bio_should_exit is set and the
+     * thread wakes from cond_wait it exits the loop still holding the mutex.
+     * Release it now so that bioSubmitJob / bioPendingJobsOfType called from
+     * other threads after pthread_join returns do not deadlock. */
+    pthread_mutex_unlock(&bio_mutex[type]);
+    return NULL;
 }
 
 /* Return the number of pending jobs of the specified type. */
@@ -291,16 +299,29 @@ unsigned long long bioWaitStepOfType(int type) {
 /* Request all BIO threads to stop cooperatively.
  * Sets the exit flag and wakes each thread's condition variable so that it
  * can observe the flag without being stuck in pthread_cond_wait.
+ *
+ * POSIX requires that a cond_broadcast protecting a predicate is issued while
+ * holding the associated mutex, so that there is no window between the waiter
+ * checking the predicate and calling cond_wait in which the signal can be lost.
+ * Without the lock:
+ *   Thread checks bio_should_exit (sees 0) → gets preempted
+ *   Main sets bio_should_exit=1, broadcasts (nobody waiting) → broadcast lost
+ *   Thread resumes, calls cond_wait → sleeps forever → pthread_join deadlocks
+ *
  * We then join each thread to ensure they have released their mutexes cleanly.
- * This avoids the previous pthread_cancel() approach which could fire while a
- * thread held bio_mutex, leaving the mutex permanently locked and causing
- * deadlocks in any subsequent bio job submission. */
+ */
 void bioKillThreads(void) {
     int err, j;
 
+    /* Signal all threads to exit: set the flag under each thread's mutex so
+     * that any thread currently between the predicate check and cond_wait
+     * will see the updated flag before sleeping, eliminating the lost-wakeup
+     * race (POSIX §2.9.3). */
     bio_should_exit = 1;
     for (j = 0; j < BIO_NUM_OPS; j++) {
+        pthread_mutex_lock(&bio_mutex[j]);
         pthread_cond_broadcast(&bio_newjob_cond[j]);
+        pthread_mutex_unlock(&bio_mutex[j]);
     }
 
     for (j = 0; j < BIO_NUM_OPS; j++) {
