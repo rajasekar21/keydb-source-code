@@ -2,8 +2,8 @@
 
 **Product:** KeyDB 6.3.4 (multi-threaded Redis fork)
 **Analysis scope:** Full production-grade audit: bugs, scalability, concurrency,
-memory safety, replication, and crash investigation
-**Total fixes:** 22 code changes across 6 categories
+memory safety, replication, crash investigation, and multi-master topology
+**Total fixes:** 24 code changes across 7 categories
 **Branch:** `main`
 
 ---
@@ -16,10 +16,11 @@ memory safety, replication, and crash investigation
 4. [Memory Safety Fixes](#4-memory-safety-fixes-mem-01--mem-03)
 5. [Replication Fixes](#5-replication-fixes-repl-01--repl-03)
 6. [BIO Shutdown Crash Fix](#6-bio-thread-shutdown-crash-bio-01--bio-03)
-7. [Complete File Change Index](#7-complete-file-change-index)
-8. [Commit History](#8-commit-history)
-9. [Upgrade Notes](#9-upgrade-notes)
-10. [Validation Checklist](#10-validation-checklist)
+7. [Multi-Master Replication Fixes](#7-multi-master-replication-fixes-mmr-01--mmr-02)
+8. [Complete File Change Index](#8-complete-file-change-index)
+9. [Commit History](#9-commit-history)
+10. [Upgrade Notes](#10-upgrade-notes)
+11. [Validation Checklist](#11-validation-checklist)
 
 ---
 
@@ -479,12 +480,88 @@ can trigger secondary crashes in the C runtime exit unwinding path.
 
 ---
 
-## 7. Complete File Change Index
+## 7. Multi-Master Replication Fixes (MMR-01 – MMR-02)
+
+### MMR-01 — `replicationCron`: Serialised Master Connection Initiation
+**File:** `src/replication.cpp` | **Severity:** High — O(N) reconnect latency in N-master topologies
+
+**Root cause:** A single `bool fInMasterConnection` flag limited connection initiation to
+at most one new master per 100 ms cron tick. When N masters all need reconnect simultaneously
+(e.g., after a network partition recovers), convergence took at least N × 100 ms. The first
+scan loop also exited early on the first mid-handshake master, skipping timeout checks on
+all later masters in that tick.
+
+**Fix:** Replaced the boolean flag with an `int active_handshakes` counter. The count is
+initialised by a full scan (no early exit). Up to `MAX_CONCURRENT_MASTER_HANDSHAKES = 4`
+parallel connection initiations are allowed per cron tick.
+
+```diff
+- bool fInMasterConnection = false;
+- while ((lnMaster = listNext(&liMaster)) && !fInMasterConnection) { ... }
++ static const int MAX_CONCURRENT_MASTER_HANDSHAKES = 4;
++ int active_handshakes = 0;
++ while ((lnMaster = listNext(&liMaster))) { ... active_handshakes++; }
+  // ...
+- if (mi->repl_state == REPL_STATE_CONNECT && !fInMasterConnection && ...)
+-     { connectWithMaster(mi); fInMasterConnection = true; }
++ if (mi->repl_state == REPL_STATE_CONNECT &&
++     active_handshakes < MAX_CONCURRENT_MASTER_HANDSHAKES && ...)
++     { connectWithMaster(mi); active_handshakes++; }
+```
+
+| Scenario | Before | After |
+|---|---|---|
+| N masters all need reconnect | N × 100 ms serialised | ≤ 1 tick for N ≤ 4 |
+| Timeout checks on later masters | Skipped when one is mid-handshake | Full scan every tick |
+
+---
+
+### MMR-02 — REPLCONF GETACK: Broadcast to All Masters Instead of Requester
+**File:** `src/replication.cpp` | **Severity:** High — O(N) unnecessary ACK writes per request
+
+**Root cause:** The REPLCONF GETACK handler iterated all entries in `g_pserver->masters`
+and called `replicationSendAck()` for every one of them. In an N-master topology, each
+GETACK from any single master triggered N ACK `write()` syscalls. This also sent ACKs to
+masters that did not request them, which could cause those masters to advance their
+`repl_backlog_off` prematurely and trim backlog that other replicas still need.
+
+The existing `MasterInfoFromClient(c)` helper (line 5367) already maps a `client*` to
+its `redisMaster*` and was unused here.
+
+**Fix:** Use `MasterInfoFromClient(c)` to send the ACK only to the requesting master.
+Fallback to the original broadcast if the lookup fails (backward-compatible).
+
+```diff
+  } else if (!strcasecmp(..., "getack")) {
+-     listIter li; listNode *ln;
+-     listRewind(g_pserver->masters, &li);
+-     while ((ln = listNext(&li)))
+-         replicationSendAck((redisMaster*)listNodeValue(ln));
++     redisMaster *requesting_master = MasterInfoFromClient(c);
++     if (requesting_master != nullptr) {
++         replicationSendAck(requesting_master);
++     } else {
++         listIter li; listNode *ln;
++         listRewind(g_pserver->masters, &li);
++         while ((ln = listNext(&li)))
++             replicationSendAck((redisMaster*)listNodeValue(ln));
++     }
+  }
+```
+
+| Scenario | Before | After |
+|---|---|---|
+| GETACK from one master in N-master setup | N ACK writes | 1 ACK write |
+| Spurious backlog trimming on unrelated masters | Possible | Eliminated |
+
+---
+
+## 8. Complete File Change Index
 
 | File | Changes Applied |
 |---|---|
 | `src/networking.cpp` | BUG-01 lock order; MEM-01 NULL guard; MEM-02 binary-safe logging |
-| `src/replication.cpp` | BUG-02 bulkreadBuffer free; BUG-07 FULLRESYNC bounds; PERF-04 repl_lowest_off; CONC-03 cycle detect; REPL-01 atomic ordering; REPL-02 repl_backlog_lock; REPL-03 overflow-safe PSYNC |
+| `src/replication.cpp` | BUG-02 bulkreadBuffer free; BUG-07 FULLRESYNC bounds; PERF-04 repl_lowest_off; CONC-03 cycle detect; REPL-01 atomic ordering; REPL-02 repl_backlog_lock; REPL-03 overflow-safe PSYNC; MMR-01 parallel handshake budget; MMR-02 targeted GETACK ACK |
 | `src/bio.cpp` | BUG-03 cooperative exit; BIO-01 broadcast under mutex; BIO-02 mutex unlock on exit; BIO-03 return NULL |
 | `src/debug.cpp` | BUG-04 `g_fInCrash` → `std::atomic<int>` |
 | `src/serverassert.h` | BUG-04 extern + macro update |
@@ -501,10 +578,11 @@ can trigger secondary crashes in the C runtime exit unwinding path.
 
 ---
 
-## 8. Commit History
+## 9. Commit History
 
 | Commit | Description |
 |---|---|
+| (pending) | fix: multi-master replication bottlenecks MMR-01, MMR-02 |
 | `1cd5ee0` | fix: three bugs in BIO cooperative-shutdown producing SIGSEGV + deadlock |
 | `3029db2` | fix: address replication risks REPL-01, REPL-02, REPL-03 |
 | `c2ca4f7` | fix: address memory safety risks MEM-01, MEM-02, MEM-03 |
@@ -514,7 +592,7 @@ can trigger secondary crashes in the C runtime exit unwinding path.
 
 ---
 
-## 9. Upgrade Notes
+## 10. Upgrade Notes
 
 - **No configuration changes required** for any fix to take effect.
 - **No on-disk format changes.** Existing RDB and AOF files load without modification.
@@ -534,7 +612,7 @@ can trigger secondary crashes in the C runtime exit unwinding path.
 
 ---
 
-## 10. Validation Checklist
+## 11. Validation Checklist
 
 ```bash
 # ── Build verification ────────────────────────────────────────────────────────

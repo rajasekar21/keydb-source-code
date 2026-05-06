@@ -1745,14 +1745,20 @@ void replconfCommand(client *c) {
             /* Note: this command does not reply anything! */
             return;
         } else if (!strcasecmp((const char*)ptrFromObj(c->argv[j]),"getack")) {
-            /* REPLCONF GETACK is used in order to request an ACK ASAP
-             * to the replica. */
-            listIter li;
-            listNode *ln;
-            listRewind(g_pserver->masters, &li);
-            while ((ln = listNext(&li)))
-            {
-                replicationSendAck((redisMaster*)listNodeValue(ln));
+            /* REPLCONF GETACK requests an ACK from us (the replica) to the
+             * master that sent the request.  In multi-master mode, send the
+             * ACK only to the requesting master; fall back to broadcasting to
+             * all masters when the client cannot be mapped (shouldn't happen
+             * in practice but keeps backward-compatible behaviour). */
+            redisMaster *requesting_master = MasterInfoFromClient(c);
+            if (requesting_master != nullptr) {
+                replicationSendAck(requesting_master);
+            } else {
+                listIter li;
+                listNode *ln;
+                listRewind(g_pserver->masters, &li);
+                while ((ln = listNext(&li)))
+                    replicationSendAck((redisMaster*)listNodeValue(ln));
             }
             return;
         } else if (!strcasecmp((const char*)ptrFromObj(c->argv[j]),"uuid")) {
@@ -4850,12 +4856,16 @@ void replicationCron(void) {
     listNode *lnMaster;
     listRewind(g_pserver->masters, &liMaster);
 
-    bool fInMasterConnection = false;
-    while ((lnMaster = listNext(&liMaster)) && !fInMasterConnection)
+    /* Count masters currently mid-handshake (connecting/transferring/auth).
+     * We allow up to MAX_CONCURRENT_MASTER_HANDSHAKES parallel connection
+     * initiations so that a slow master does not stall the others. */
+    static const int MAX_CONCURRENT_MASTER_HANDSHAKES = 4;
+    int active_handshakes = 0;
+    while ((lnMaster = listNext(&liMaster)))
     {
         redisMaster *mi = (redisMaster*)listNodeValue(lnMaster);
         if (mi->repl_state != REPL_STATE_NONE && mi->repl_state != REPL_STATE_CONNECTED && mi->repl_state != REPL_STATE_CONNECT) {
-            fInMasterConnection = true;
+            active_handshakes++;
         }
     }
 
@@ -4895,12 +4905,17 @@ void replicationCron(void) {
             disconnectMaster(mi);
         }
 
-        /* Check if we should connect to a MASTER */
-        if (mi->repl_state == REPL_STATE_CONNECT && !fInMasterConnection && !g_pserver->loading && !g_pserver->FRdbSaveInProgress()) {
+        /* Check if we should connect to a MASTER — allow up to
+         * MAX_CONCURRENT_MASTER_HANDSHAKES parallel initiations so N-master
+         * topologies do not serialize connection setup one-per-cron-tick. */
+        if (mi->repl_state == REPL_STATE_CONNECT &&
+            active_handshakes < MAX_CONCURRENT_MASTER_HANDSHAKES &&
+            !g_pserver->loading && !g_pserver->FRdbSaveInProgress())
+        {
             serverLog(LL_NOTICE,"Connecting to MASTER %s:%d",
                 mi->masterhost, mi->masterport);
             connectWithMaster(mi);
-            fInMasterConnection = true;
+            active_handshakes++;
             fConnectionStarted = true;
         }
 
