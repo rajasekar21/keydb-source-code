@@ -582,7 +582,7 @@ Fallback to the original broadcast if the lookup fails (backward-compatible).
 
 | Commit | Description |
 |---|---|
-| (pending) | fix: multi-master replication bottlenecks MMR-01, MMR-02 |
+| `2609172` | fix: multi-master replication bottlenecks MMR-01, MMR-02 |
 | `1cd5ee0` | fix: three bugs in BIO cooperative-shutdown producing SIGSEGV + deadlock |
 | `3029db2` | fix: address replication risks REPL-01, REPL-02, REPL-03 |
 | `c2ca4f7` | fix: address memory safety risks MEM-01, MEM-02, MEM-03 |
@@ -609,6 +609,13 @@ Fallback to the original broadcast if the lookup fails (backward-compatible).
   before `pthread_join` returns. Any code that submitted a BIO job after `bioKillThreads`
   was called (a pre-existing programming error) will now deadlock instead of crashing —
   this is the correct behaviour and surfaces the bug rather than hiding it.
+- **`MAX_CONCURRENT_MASTER_HANDSHAKES = 4` (MMR-01):** Topologies with more than 4
+  masters all needing simultaneous reconnect will still serialise beyond the 4th; the cap
+  prevents resource exhaustion. Increase the constant in `replicationCron()` if your
+  topology consistently has more than 4 masters reconnecting at once.
+- **REPLCONF GETACK scoping (MMR-02):** Masters that send GETACK will now receive exactly
+  one ACK response instead of N. This is protocol-correct and matches what single-master
+  Redis does; no master-side configuration change is needed.
 
 ---
 
@@ -674,4 +681,19 @@ limit = (2**64 - 1) // 24
 print(f'Safe arraylen ceiling: {limit:,}')
 print(f'Requires {limit * 24 / 2**40:.0f} TB RAM — unreachable in practice')
 "
+
+# ── Multi-master parallel reconnect (MMR-01) ─────────────────────────────────
+# Start 3 masters (6381, 6382, 6383) and one replica (6379) configured to
+# replicate from all three. Restart all masters simultaneously; measure
+# time for replica to reach master_link_status:up on all three:
+watch -n 0.1 'redis-cli -p 6379 info replication | grep -c master_link_status:up'
+# Expected before fix: ~300 ms (3 × 100 ms cron ticks)
+# Expected after fix:  ~100 ms (1 cron tick for N=3 ≤ 4)
+
+# ── Multi-master targeted GETACK (MMR-02) ────────────────────────────────────
+# In a 3-master topology, enable debug logging and count ACK lines per GETACK:
+redis-cli -p 6379 CONFIG SET loglevel debug
+grep -c "Sending REPLCONF ACK" /var/log/keydb/keydb.log
+# Expected before fix: 3 ACK lines per GETACK from any single master
+# Expected after fix:  1 ACK line per GETACK (only to requesting master)
 ```
